@@ -29,6 +29,8 @@ std::shared_ptr<spdlog::logger> createStderrLogger(const std::string& name,
     sinks.push_back(file_sink);
   }
 
+  sinks.push_back(std::make_shared<spdlog::sinks::null_sink<std::mutex>>());
+
   auto logger = std::make_shared<spdlog::logger>(name, begin(sinks), end(sinks));
 
   spdlog::register_logger(logger);

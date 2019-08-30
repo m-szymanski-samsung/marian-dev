@@ -3,6 +3,7 @@
 #include "common/definitions.h"
 #include "common/filesystem.h"
 #include "common/utils.h"
+#include "layers/loss.h"
 
 #include <fstream>
 #include <vector>
@@ -100,18 +101,31 @@ public:
   float factor{1.f};
   SchedulingParameter warmupStart; // has same unit as lr-warmup
 
-  // Sum of costs since last display
-  float costSum{0};
-  // Number of labels aggregated in
-  // costSum since last display
-  size_t costCount{0};
+  struct SinceLastDisplay {
+    // Sum of costs since last display
+    float costSum{0};
+    // Number of labels aggregated in costSum since last display
+    size_t costCount{0};
 
-  // Number of words seen since last display
-  size_t wordsDisp{0};
-  // Number of samples/sentences seen since last display
-  size_t samplesDisp{0};
-  // Number of updates seen since last display
-  size_t updatesDisp{0};
+    // Number of words seen since last display
+    size_t words{0};
+    // Number of samples/sentences seen since last display
+    size_t samples{0};
+    // Number of updates seen since last display
+    size_t updates{0};
+
+    void reset() { *this = SinceLastDisplay(); }
+    void update(const StaticLoss &rationalLoss, size_t batchSize, size_t batchLabels) {
+      // @BUGBUG: rationalLoss.count is float, not a count. Possible solution: make (costSum, costCount) a StaticLoss object as well
+      costSum      += rationalLoss.loss;   // aggregate sum cost since last display
+      costCount    += (size_t)rationalLoss.count; // cost gets normalized w.r.t. this in display
+
+      updates  += 1;
+      samples  += batchSize;
+      words    += batchLabels;  //@TODO: this is wrong        // words at given input processed since last display, for speed display
+    }
+  };
+  SinceLastDisplay since_last_display;
 
   // The state of the random number generator from a batch generator
   std::string seedBatch;
@@ -243,12 +257,12 @@ public:
     factor = config["eta-factor"].as<float>();
     warmupStart = SchedulingParameter::parse(config["warmup-start"].as<std::string>());
 
-    costSum = config["cost-sum"].as<float>();
-    costCount = config["cost-count"].as<size_t>();
+    since_last_display.costSum = config["cost-sum"].as<float>();
+    since_last_display.costCount = config["cost-count"].as<size_t>();
 
-    wordsDisp = config["disp-words"].as<size_t>();
-    samplesDisp = config["disp-samples"].as<size_t>();
-    updatesDisp = config["disp-updates"].as<size_t>();
+    since_last_display.words = config["disp-words"].as<size_t>();
+    since_last_display.samples = config["disp-samples"].as<size_t>();
+    since_last_display.updates = config["disp-updates"].as<size_t>();
 
     seedBatch = config["seed-batch"].as<std::string>();
     seedCorpus = config["seed-corpus"].as<std::string>();
@@ -278,12 +292,12 @@ public:
     config["eta-factor"] = factor;
     config["warmup-start"] = std::string(warmupStart);
 
-    config["cost-sum"] = costSum;
-    config["cost-count"] = costCount;
+    config["cost-sum"] = since_last_display.costSum;
+    config["cost-count"] = since_last_display.costCount;
 
-    config["disp-updates"] = updatesDisp;
-    config["disp-samples"] = samplesDisp;
-    config["disp-words"] = wordsDisp;
+    config["disp-updates"] = since_last_display.updates;
+    config["disp-samples"] = since_last_display.samples;
+    config["disp-words"] = since_last_display.words;
 
     config["seed-batch"] = seedBatch;
     config["seed-corpus"] = seedCorpus;
