@@ -40,8 +40,12 @@ public:
   virtual float validate(const std::vector<Ptr<ExpressionGraph>>& graphs) = 0;
   virtual std::string type() = 0;
 
-  float lastBest() { return lastBest_; }
-  size_t stalled() { return stalled_; }
+  float lastBest() const { return lastBest_; }
+  size_t stalled() const { return stalled_; }
+  std::string stallReport() const {
+    auto stallc = stalled();
+    return (stallc>0)? ("stalled "+std::to_string(stallc)+" times (last best: "+std::to_string(lastBest())+")") : "new best";
+  }
 
   virtual float initScore() {
     return lowerIsBetter_ ? std::numeric_limits<float>::max()

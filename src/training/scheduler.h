@@ -5,6 +5,7 @@
 #include "training/validator.h"
 #include "training/communicator.h"
 #include "layers/loss.h"
+#include "logged_stats.h"
 
 namespace marian {
 
@@ -13,6 +14,7 @@ private:
   Ptr<Options> options_;
   Ptr<TrainingState> state_;
   std::vector<Ptr<ValidatorBase>> validators_;
+  LoggingContainer updateStatsLogger_;
 
   bool first_{true};
 
@@ -72,37 +74,50 @@ private:
     state.updateEta(baselr);
   }
 
-  std::string formatLoss(std::string lossType,
-                         bool dispLabelCounts,
-                         size_t batchLabels,
-                         Ptr<TrainingState> state) {
-    std::stringstream ss;
-    ss << "Cost ";
-    ss << std::setprecision(8) << std::fixed;
-
-    // @TODO: put a single loss formatting function into loss.h and reuse here to avoid code duplication
-    // @TODO: use dispLabelCounts with any display type?
-    // @TODO: bugbug cost-type ce-mean-words with multi-loss-type mean divides too much in display
-    if(lossType == "ce-mean-words") {
-      ss << state->costSum / state->costCount;
-    } else if(lossType == "ce-sum" && dispLabelCounts) {
-      ss << state->costSum / state->costCount
-         << " * " << utils::withCommas(state->costCount);
-      if(batchLabels > 0)
-         ss << " @ " << utils::withCommas(batchLabels);
-      ss << " after " << utils::withCommas(state->labelsTotal);
-    } else if(lossType == "ce-sum" && !dispLabelCounts) {
-      ss << state->costSum / state->updatesDisp; // average over batches
-    } else if(lossType == "perplexity") {
-      ss << std::exp(state->costSum / state->costCount);
-    } else if(lossType == "cross-entropy" || lossType == "ce-mean") { // backwards-compat, @TODO: get rid of this?
-      ss << state->costSum / state->samplesDisp;
-    } else {
-      ABORT("Unknown loss type {}", lossType);
+  struct CostStatsDisplay : public LoggedStatAbstractBase {
+    Ptr<TrainingState> state_;
+    std::string lossType_;
+    bool dispLabelCounts_;
+    CostStatsDisplay(Ptr<TrainingState> state, Ptr<Options> options) : LoggedStatAbstractBase("",""), state_(state) {
+      // reconstruct sum cost, for displaying epoch-level averages instead of minibatch-level
+      lossType_ = options->get<decltype(lossType_)>("cost-type");
+      dispLabelCounts_ = options->get<decltype(dispLabelCounts_)>("disp-label-counts");  // if true then show as "cost per label * number of labels"
     }
+    std::string formatValue() const override { return formatLoss(lossType_, dispLabelCounts_, 0/*ignore batchLabels*/, state_);};
+    void reset() override {state_->sinceLastDisplay.reset();}
+    static std::string formatLoss(std::string lossType,
+                          bool dispLabelCounts,
+                          size_t batchLabels,
+                          Ptr<TrainingState> state) {
+      const auto &since_disp = state->sinceLastDisplay;
+      std::stringstream ss;
+      ss << "Cost ";
+      ss << std::setprecision(8) << std::fixed;
 
-    return ss.str();
-  }
+      // @TODO: put a single loss formatting function into loss.h and reuse here to avoid code duplication
+      // @TODO: use dispLabelCounts with any display type?
+      // @TODO: bugbug cost-type ce-mean-words with multi-loss-type mean divides too much in display
+      if(lossType == "ce-mean-words") {
+        ss << since_disp.costSum / since_disp.costCount;
+      } else if(lossType == "ce-sum" && dispLabelCounts) {
+        ss << since_disp.costSum / since_disp.costCount
+          << " * " << utils::withCommas(since_disp.costCount);
+        if(batchLabels > 0)
+          ss << " @ " << utils::withCommas(batchLabels);
+        ss << " after " << utils::withCommas(state->labelsTotal);
+      } else if(lossType == "ce-sum" && !dispLabelCounts) {
+        ss << since_disp.costSum / since_disp.updates; // average over batches
+      } else if(lossType == "perplexity") {
+        ss << std::exp(since_disp.costSum / since_disp.costCount);
+      } else if(lossType == "cross-entropy" || lossType == "ce-mean") { // backwards-compat, @TODO: get rid of this?
+        ss << since_disp.costSum / since_disp.samples;
+      } else {
+        ABORT("Unknown loss type {}", lossType);
+      }
+
+      return ss.str();
+    }
+  };
 
 public:
   // test if any parameters specify dynamic MB scaling
@@ -146,6 +161,14 @@ public:
       : options_(options), state_(state) {
     ABORT_IF(state_->factor != 1, "state.factor unexpectedly not 1 at this point??");
     updateLearningRate(*state);
+
+    updateStatsLogger_.addVariable("Ep.", state_->epochs);
+    updateStatsLogger_.addVariable("Up.", state_->batches);
+    updateStatsLogger_.addLambda("Sen.", [&](){ return utils::withCommas(state_->samplesEpoch);});
+    updateStatsLogger_.addObject(New<CostStatsDisplay>(state_, options_));
+    updateStatsLogger_.addLambda("Time", "{:.2f}", [&](){return timer_.elapsed();}, "s", [&](){timer_.start();});
+    updateStatsLogger_.addLambda("", "{:.2f}", [&](){return state_->sinceLastDisplay.words / timer_.elapsed();}, " words/s");
+    if(options_->get<bool>("lr-report")) updateStatsLogger_.addVariable("L.r.", "{:.4e}", state_->eta);
   }
 
   bool keepGoing() {
@@ -215,22 +238,14 @@ public:
 
       size_t stalledPrev = validator->stalled();
       float value = validator->validate(graphs);
-      if(validator->stalled() > 0) {
-        LOG_VALID(info,
-                  "Ep. {} : Up. {} : {} : {} : stalled {} times (last best: {})",
-                  state_->epochs,
-                  state_->batches,
-                  validator->type(),
-                  value,
-                  validator->stalled(), validator->lastBest());
-      } else {
-        LOG_VALID(info,
-                  "Ep. {} : Up. {} : {} : {} : new best",
-                  state_->epochs,
-                  state_->batches,
-                  validator->type(),
-                  value);
-
+      LOG_VALID(info,
+                "Ep. {} : Up. {} : {} : {} : {}",
+                state_->epochs,
+                state_->batches,
+                validator->type(),
+                value,
+                validator->stallReport());
+      if(validator->stalled() <= 0) {
         if(firstValidator)
           state_->validBest = value;
       }
@@ -277,13 +292,7 @@ public:
     if(mpi)
       rationalLoss.loss *= mpi->numMPIProcesses();
 
-    // @BUGBUG: rationalLoss.count is float, not a count. Possible solution: make (costSum, costCount) a StaticLoss object as well
-    state_->costSum      += rationalLoss.loss;   // aggregate sum cost since last display
-    state_->costCount    += (size_t)rationalLoss.count; // cost gets normalized w.r.t. this in display
-
-    state_->updatesDisp  += 1;
-    state_->samplesDisp  += batchSize;
-    state_->wordsDisp    += batchLabels;  //@TODO: this is wrong        // words at given input processed since last display, for speed display
+    state_->sinceLastDisplay.update(rationalLoss.loss, rationalLoss.count, batchSize, batchLabels);
 
     state_->samplesEpoch += batchSize;          // sentences processed in this epoch
     // @BUGBUG: rationalLoss.count is float, not a count
@@ -291,49 +300,22 @@ public:
 
     state_->newUpdate(numReadBatches);
 
-    // reconstruct sum cost, for displaying epoch-level averages instead of minibatch-level
-    auto lossType = options_->get<std::string>("cost-type");
-    auto dispLabelCounts = options_->get<bool>("disp-label-counts");  // if true then show as "cost per label * number of labels"
-
     if(state_->enteredNewPeriodOf(options_->get<std::string>("disp-freq")) ||
        state_->batches <= options_->get<size_t>("disp-first")) {
       // if MPI then aggregate precise cost across workers
       if(mpi) {
-        state_->costSum /= mpi->numMPIProcesses(); // undo the extra scaling
-        mpi->allReduce(&state_->costSum, &state_->costSum, 1, MPI_FLOAT, MPI_SUM);
+        state_->sinceLastDisplay.costSum /= mpi->numMPIProcesses(); // undo the extra scaling
+        mpi->allReduce(&state_->sinceLastDisplay.costSum, &state_->sinceLastDisplay.costSum, 1, MPI_FLOAT, MPI_SUM);
       }
 
       if(mpi && mpi->myMPIRank() != 0) {
         // skip the report on alternate worker processes
-      } else if(options_->get<bool>("lr-report")) {
-        LOG(info,
-            "Ep. {} : Up. {} : Sen. {} : {} : Time {:.2f}s : {:.2f} words/s : L.r. {:.4e}",
-            state_->epochs,
-            state_->batches,
-            utils::withCommas(state_->samplesEpoch),
-            formatLoss(lossType, dispLabelCounts, batchLabels, state_),
-            timer_.elapsed(),
-            state_->wordsDisp / timer_.elapsed(),
-            state_->eta);
       } else {
-        LOG(info,
-            "Ep. {} : Up. {} : Sen. {} : {} : Time {:.2f}s : {:.2f} words/s",
-            state_->epochs,
-            state_->batches,
-            utils::withCommas(state_->samplesEpoch),
-            formatLoss(lossType, dispLabelCounts, 0, state_), // ignore batchLabels
-            timer_.elapsed(),
-            state_->wordsDisp / timer_.elapsed());
+          updateStatsLogger_.logInfo();
       }
 
+        updateStatsLogger_.resetAll();
 
-      timer_.start();
-      state_->costSum      = 0;
-      state_->costCount    = 0;
-
-      state_->updatesDisp  = 0;
-      state_->samplesDisp  = 0;
-      state_->wordsDisp    = 0;
     }
 
     // progress heartbeat for MS-internal Philly compute cluster
@@ -343,7 +325,7 @@ public:
        && heartBeatTimer_.elapsed<std::chrono::minutes>() >= 10) {
       printf("PROGRESS: %.2f%%\nEVALERR: %.7f%%\n",
           (double)state_->epochs,
-          state_->costSum / state_->costCount / (mpi ? mpi->numMPIProcesses() : 1));
+             state_->sinceLastDisplay.costSum / state_->sinceLastDisplay.costCount / (mpi ? mpi->numMPIProcesses() : 1));
       fflush(stdout);
       std::cout << "MBSIZE: " << batchLabels << " after " << state_->batches << " updates = " << state_->labelsTotal << " labels" << std::endl << std::flush;
       heartBeatTimer_.start();
@@ -357,12 +339,7 @@ public:
 
     if(options_->get<bool>("no-restore-corpus")) {
       state_->samplesEpoch = 0;
-      state_->costSum      = 0;
-      state_->costCount    = 0;
-
-      state_->updatesDisp  = 0;
-      state_->samplesDisp  = 0;
-      state_->wordsDisp    = 0;
+      state_->sinceLastDisplay.reset();
     }
 
     state_->newLoad();
